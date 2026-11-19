@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.wawii16.omarchy-lyrics",
+  "name": "Omarchy Lyrics",
+  "version": "1.0.0",
+  "author": "wawii16",
+  "description": "Synchronized lyrics for Adam Apple Music",
+  "kinds": ["service", "overlay", "bar-widget"],
+  "keepLoaded": true,
+  "entryPoints": {"service": "Service.qml", "overlay": "Overlay.qml", "barWidget": "BarWidget.qml"},
+  "barWidget": {"displayName": "Omarchy Lyrics", "description": "Current Adam lyric", "category": "Media", "allowMultiple": false}
+}
