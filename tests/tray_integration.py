@@ -88,7 +88,8 @@ def main():
             layout = dbus(menu, 'com.canonical.dbusmenu', 'GetLayout',
                           GLib.Variant('(iias)', (0, -1, [])), '(u(ia{sv}av))')[1]
             entries = {child[1].get('label'): child[0] for child in layout[2]}
-            expected = {'Show / hide lyrics', 'Overlay mode', 'Bar mode', 'Edit / lock overlay position'}
+            expected = {'Show / hide lyrics', 'Overlay mode', 'Bar mode', 'Edit / lock overlay position',
+                        'Lyrics earlier (+0.1s)', 'Lyrics later (-0.1s)', 'Reset timing'}
             assert set(entries) == expected, entries
             def ipc():
                 result = subprocess.run(['quickshell', 'ipc', '-p', str(tmp / 'shell.qml'), 'call',
@@ -103,7 +104,21 @@ def main():
             click('Edit / lock overlay position'); wait_for(lambda: ipc()['mode'] == 'overlay' and ipc()['edit'] and ipc()['visible'])
             click('Edit / lock overlay position'); wait_for(lambda: not ipc()['edit'])
             click('Overlay mode'); wait_for(lambda: ipc()['mode'] == 'overlay')
-            print('PASS private watcher registration, real DBus menu actions -> QML state')
+            timing = tmp / 'config/adam-lyrics/timing.json'
+            assert ipc()['advance_ms'] == 0
+            click('Lyrics earlier (+0.1s)'); wait_for(lambda: ipc()['advance_ms'] == 100)
+            wait_for(lambda: json.loads(timing.read_text()) == {'advance_ms': 100})
+            click('Lyrics later (-0.1s)'); wait_for(lambda: ipc()['advance_ms'] == 0)
+            click('Lyrics later (-0.1s)'); wait_for(lambda: ipc()['advance_ms'] == -100)
+            click('Reset timing'); wait_for(lambda: ipc()['advance_ms'] == 0)
+            wait_for(lambda: json.loads(timing.read_text()) == {'advance_ms': 0})
+            for _ in range(25): click('Lyrics earlier (+0.1s)')
+            wait_for(lambda: ipc()['advance_ms'] == 2000)
+            wait_for(lambda: json.loads(timing.read_text()) == {'advance_ms': 2000})
+            for _ in range(45): click('Lyrics later (-0.1s)')
+            wait_for(lambda: ipc()['advance_ms'] == -2000)
+            wait_for(lambda: json.loads(timing.read_text()) == {'advance_ms': -2000})
+            print('PASS private watcher registration, real DBus menu actions -> QML state and timing file')
         finally:
             if host:
                 host.terminate(); host.wait(timeout=5)

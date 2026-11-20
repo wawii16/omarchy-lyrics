@@ -19,6 +19,9 @@ def main():
         ('Overlay mode', 'overlay'),
         ('Bar mode', 'bar'),
         ('Edit / lock overlay position', 'edit'),
+        ('Lyrics earlier (+0.1s)', 'timing-earlier'),
+        ('Lyrics later (-0.1s)', 'timing-later'),
+        ('Reset timing', 'timing-reset'),
     ):
         item = Gtk.MenuItem(label=label)
         item.connect('activate', lambda _item, value=command: print(value, flush=True))
