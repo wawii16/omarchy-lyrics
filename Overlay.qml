@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Wayland
 import Quickshell.Hyprland
+import qs.Commons as Commons
 
 Item {
     id: root
@@ -15,10 +16,15 @@ Item {
     readonly property bool editMode: service ? service.editMode : false
     readonly property bool hasContent: service ? service.hasContent : false
     readonly property string lyric: service ? service.lyric : ""
+    readonly property string nextLyric: service ? service.nextLyric : ""
+    readonly property alias currentLine: currentLabel
+    readonly property alias nextLine: nextLabel
     readonly property int offsetX: service ? service.offsetX : -1
     readonly property int offsetY: service ? service.offsetY : -1
     property bool fullscreen: false
     readonly property bool displayed: panel.visible
+    TextMetrics { id: currentMetrics; text: root.lyric; font.family: Commons.Style.font.family; font.pixelSize: 18; font.bold: true }
+    TextMetrics { id: nextMetrics; text: root.nextLyric; font.family: Commons.Style.font.family; font.pixelSize: 15 }
     readonly property int positionX: Math.min(Math.max(0, (panel.screen ? panel.screen.width : 520) - panel.implicitWidth), offsetX >= 0 ? offsetX : Math.max(0, Math.round(((panel.screen ? panel.screen.width : 520) - panel.implicitWidth) / 2)))
     readonly property int positionY: Math.min(Math.max(0, (panel.screen ? panel.screen.height : 1200) - panel.implicitHeight), offsetY >= 0 ? offsetY : Math.max(0, (panel.screen ? panel.screen.height : 1200) - panel.implicitHeight - 80))
     Timer { interval: 1000; running: true; repeat: true; onTriggered: { Hyprland.refreshToplevels(); Hyprland.refreshMonitors() } }
@@ -49,7 +55,7 @@ Item {
         visible: root.mode === "overlay" && root.userVisible && !root.fullscreen && (root.editMode || root.hasContent)
         anchors { top: true; left: true }
         margins { top: root.positionY; left: root.positionX }
-        implicitWidth: 520; implicitHeight: 74
+        implicitWidth: Math.min(panel.screen ? panel.screen.width : 520, Math.max(520, Math.ceil(Math.max(currentMetrics.width, nextMetrics.width)) + 24)); implicitHeight: 74
         exclusionMode: ExclusionMode.Ignore
         color: "transparent"
         WlrLayershell.layer: WlrLayer.Overlay
@@ -60,25 +66,48 @@ Item {
             id: background
             anchors.fill: parent
             radius: 12
-            color: root.editMode ? "#e62b3548" : "transparent"
-            border.color: root.editMode ? "#8cbeff" : "transparent"
+            color: root.editMode ? Commons.Color.popups.background : "transparent"
+            border.color: root.editMode ? Commons.Color.popups.border : "transparent"
             border.width: root.editMode ? 1 : 0
             Text {
                 visible: root.editMode
                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
                 anchors.margins: 10; height: 15
                 text: "DRAG TO REPOSITION • Select edit again to lock"
-                color: "#aebcd0"; font.pixelSize: 10; font.bold: true
+                color: Commons.Color.popups.text; font.family: Commons.Style.font.family; font.pixelSize: 10; font.bold: true
                 elide: Text.ElideRight
             }
-            Text {
+            Item {
                 anchors.fill: parent
                 anchors.topMargin: root.editMode ? 24 : 0
                 anchors.leftMargin: 10; anchors.rightMargin: 10
-                text: root.lyric; color: "white"; font.pixelSize: 18; font.bold: true
-                style: Text.Raised; styleColor: "#b0000000"
-                textFormat: Text.PlainText; elide: Text.ElideRight
-                horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                Column {
+                    anchors.centerIn: parent
+                    width: parent.width
+                    Text {
+                        id: currentLabel
+                        width: parent.width; height: 24
+                        text: root.lyric; color: Commons.Color.foreground
+                        font.family: Commons.Style.font.family; font.pixelSize: 18; font.bold: true
+                        style: Text.Outline; styleColor: Commons.Color.background
+                        textFormat: Text.PlainText; elide: Text.ElideNone; wrapMode: Text.NoWrap
+                        fontSizeMode: Text.HorizontalFit; minimumPixelSize: 1
+                        scale: Math.min(1, (width - 2) / Math.max(1, contentWidth))
+                        horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                    }
+                    Text {
+                        id: nextLabel
+                        visible: text.length > 0
+                        width: parent.width; height: visible ? 21 : 0
+                        text: root.nextLyric; color: Commons.Color.foreground; opacity: 0.62
+                        font.family: Commons.Style.font.family; font.pixelSize: 15
+                        style: Text.Outline; styleColor: Commons.Color.background
+                        textFormat: Text.PlainText; elide: Text.ElideNone; wrapMode: Text.NoWrap
+                        fontSizeMode: Text.HorizontalFit; minimumPixelSize: 1
+                        scale: Math.min(1, (width - 2) / Math.max(1, contentWidth))
+                        horizontalAlignment: Text.AlignHCenter; verticalAlignment: Text.AlignVCenter
+                    }
+                }
             }
             MouseArea {
                 anchors.fill: parent; enabled: root.editMode; cursorShape: Qt.SizeAllCursor

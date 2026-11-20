@@ -15,7 +15,7 @@ open(os.environ["TEST_PID"],"w").write(str(os.getpid()))
 p=sys.argv[sys.argv.index("--state")+1]
 while True:
  t=p+".tmp"
- with open(t,"w") as f: json.dump(dict(text="fixture line",playback="Playing",unavailable=False,track="fixture",updated=time.time()),f)
+ with open(t,"w") as f: json.dump(dict(text="fixture line",next_text="next fixture",playback="Playing",unavailable=False,track="fixture",updated=time.time()),f)
  os.replace(t,p)
  time.sleep(.2)
 ''')
@@ -25,6 +25,7 @@ while True:
 import Quickshell
 import "plugin" as Plugin
 import qs.services as Services
+import qs.Commons as Commons
 ShellRoot {
   id: root
   property var svc: loader.item
@@ -33,12 +34,16 @@ ShellRoot {
   Plugin.BarWidget { id: widget; bar: fakeBar }
   Services.PluginRegistry { id: registry }
   QtObject { id: fakeShell; function serviceFor(id) { return svc } }
-  QtObject { id: fakeBar; property var shell: fakeShell; property bool vertical: false; property int barSize: 30; property color barForeground: "white"; property string fontFamily: "sans" }
+  QtObject { id: fakeBar; property var shell: fakeShell; property bool vertical: false; property int barSize: 26; property color barForeground: "white"; property string fontFamily: "sans" }
   Timer { interval: 3500; running: true; onTriggered: {
     let m = JSON.parse(manifestFile.text())
     if (!registry.validateManifest(m, "test") || svc.lyric !== "fixture line" || !svc.hasContent || overlay.displayed) { console.log("SMOKE_FAIL",svc.lyric,svc.hasContent); Qt.quit(); return }
     svc.setMode("bar"); svc.userVisible = true
     if (!widget.showLyric || widget.implicitWidth <= 0 || overlay.displayed) { console.log("SMOKE_FAIL bar",widget.showLyric,widget.implicitWidth,overlay.displayed); Qt.quit(); return }
+    if (!overlay.currentLine || !overlay.nextLine || !widget.currentLine || !widget.nextLine || overlay.currentLine.text !== "fixture line" || overlay.nextLine.text !== "next fixture" || widget.currentLine.text.indexOf("fixture line") < 0 || widget.nextLine.text !== "next fixture") { console.log("SMOKE_FAIL two lines"); Qt.quit(); return }
+    Commons.Color.foreground = "#44bb77"
+    fakeBar.barForeground = "#ddaa44"
+    if (overlay.currentLine.color.toString() !== "#44bb77" || overlay.nextLine.color.toString() !== "#44bb77" || widget.currentLine.color.toString() !== "#ddaa44" || widget.nextLine.color.toString() !== "#ddaa44" || overlay.nextLine.opacity >= overlay.currentLine.opacity || widget.nextLine.opacity >= widget.currentLine.opacity) { console.log("SMOKE_FAIL live theme"); Qt.quit(); return }
     svc.edit(); svc.userVisible = false
     if (!svc.editMode || widget.showLyric || overlay.displayed) { console.log("SMOKE_FAIL edit"); Qt.quit(); return }
     svc.edit(); svc.userVisible = false
