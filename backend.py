@@ -2,7 +2,9 @@
 """Publish Adam's current lyric to a small JSON state file."""
 import json
 import os
+import queue
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 import ssl
@@ -123,8 +125,47 @@ class PlaybackDetector:
         return 'Paused' if self.seen_playing and track else 'Stopped'
 
 
+class MprisClock:
+    """Interpolate coarse MPRIS positions only after observing movement.
+
+    Position is never extrapolated more than one second past the latest
+    observed advance; a frozen or misreported player cannot drift forever.
+    """
+    MAX_EXTRAPOLATION = 1.0
+
+    def __init__(self):
+        self.track = None
+        self.raw = None
+        self.anchor_at = None
+        self.output = None
+        self.active = False
+
+    def resolve(self, snapshot, now):
+        track = snapshot.get('id')
+        position = snapshot.get('position', 0)
+        playing = snapshot.get('playback') == 'Playing' and bool(track)
+        if (track != self.track or self.raw is None or not playing
+                or not self.active or now < self.anchor_at):
+            self.track, self.raw, self.anchor_at = track, position, now
+            self.output, self.active = position, playing
+            self.moving = False
+            return position
+        if position != self.raw:
+            elapsed = now - self.anchor_at
+            delta = position - self.raw
+            # Large forward jumps and every backwards jump are seeks.
+            seek = delta < 0 or delta > elapsed + self.MAX_EXTRAPOLATION
+            self.output = position if seek else max(position, self.output)
+            self.raw, self.anchor_at = position, now
+            self.moving = not seek
+        elif self.moving:
+            estimate = position + min(max(0, now - self.anchor_at), self.MAX_EXTRAPOLATION)
+            self.output = max(self.output, estimate)
+        return self.output
+
+
 class LyricsBackend:
-    def __init__(self, path, fetch, retry_seconds=30, refresh_clock=None):
+    def __init__(self, path, fetch, retry_seconds=30, refresh_clock=None, asynchronous=False):
         self.path = Path(path)
         self.fetch = fetch
         self.refresh_clock = refresh_clock
@@ -132,6 +173,20 @@ class LyricsBackend:
         self.retry_at = 0
         self.track_id = None
         self.lines = []
+        self.asynchronous = asynchronous
+        self.results = queue.SimpleQueue()
+        self.generation = 0
+        self.fetching = False
+        self.fetch_completed = False
+
+    def fetch_async(self, track_id, generation):
+        try:
+            lines = parse_ttml(self.fetch(track_id))
+        except Exception:
+            # Fetch/parsing failures must complete the request without logging
+            # exception details, which may contain response data or credentials.
+            lines = []
+        self.results.put((generation, lines))
 
     def update(self, snapshot):
         track_id = snapshot.get('id')
@@ -139,10 +194,25 @@ class LyricsBackend:
             self.track_id = track_id
             self.lines = []
             self.retry_at = 0
-        if track_id and not self.lines and time.monotonic() >= self.retry_at:
+            self.generation += 1
+            self.fetching = False
+            self.fetch_completed = False
+        if self.asynchronous:
+            while not self.results.empty():
+                generation, lines = self.results.get_nowait()
+                if generation == self.generation:
+                    self.lines = lines
+                    self.fetching = False
+                    self.fetch_completed = True
+                    self.retry_at = time.monotonic() + self.retry_seconds
+            if track_id and not self.lines and not self.fetching and time.monotonic() >= self.retry_at:
+                self.fetching = True
+                threading.Thread(target=self.fetch_async, args=(track_id, self.generation), daemon=True).start()
+        elif track_id and not self.lines and time.monotonic() >= self.retry_at:
             try:
                 self.lines = parse_ttml(self.fetch(track_id))
-            except (OSError, ValueError, ET.ParseError):
+            except Exception:
+                # Match async fetch handling without logging response data.
                 self.lines = []
             self.retry_at = time.monotonic() + self.retry_seconds
             # Fetching lyrics can take seconds; do not publish the pre-fetch clock.
@@ -152,13 +222,28 @@ class LyricsBackend:
                     self.track_id = snapshot.get('id')
                     self.lines = []
                     self.retry_at = 0
-        position = snapshot.get('position', 0)
+        config_dir = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+        try:
+            advance_ms = json.loads((config_dir / 'adam-lyrics' / 'timing.json').read_text(encoding='utf-8'))['advance_ms']
+        except (OSError, ValueError, KeyError, TypeError):
+            advance_ms = 0
+        if type(advance_ms) is not int or advance_ms % 100:
+            advance_ms = 0
+        advance_ms = max(-2000, min(2000, advance_ms))
+        position = snapshot.get('position', 0) + advance_ms / 1000
         current = ''
-        for index, (begin, end, text) in enumerate(self.lines):
-            next_begin = self.lines[index + 1][0] if index + 1 < len(self.lines) else None
-            if begin <= position and (end is None or position < end) and (next_begin is None or position < next_begin):
-                current = text
-        state = {'text': current, 'playback': snapshot.get('playback', 'Stopped'), 'unavailable': not bool(self.lines), 'track': snapshot.get('title', ''), 'track_id': snapshot.get('id'), 'updated': time.time()}
+        next_text = ''
+        for begin, _end, text in self.lines:
+            if begin > position:
+                next_text = text
+                break
+            current = text
+        playback = snapshot.get('playback', 'Stopped')
+        duration = snapshot.get('duration')
+        # The lyric offset changes highlighting, not the actual track boundary.
+        if isinstance(duration, (int, float)) and duration > 0 and snapshot.get('position', 0) >= duration:
+            current, next_text, playback = '', '', 'Stopped'
+        state = {'text': current, 'next_text': next_text, 'playback': playback, 'unavailable': (not self.fetching or self.fetch_completed) and not bool(self.lines), 'track': snapshot.get('title', ''), 'track_id': snapshot.get('id'), 'updated': time.time()}
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         fd, name = tempfile.mkstemp(dir=self.path.parent, prefix='.state-', suffix='.tmp')
         try:
@@ -183,6 +268,7 @@ def main():
     parser.add_argument('--once', action='store_true')
     args = parser.parse_args()
     detector = PlaybackDetector()
+    clock = MprisClock()
     if not args.unsafe_vlc_clock:
         print('VLC clock disabled: track identity cannot be verified; MPRIS may lag or freeze. '
               'Use --unsafe-vlc-clock to opt in to duration-only matching.', file=sys.stderr)
@@ -192,11 +278,13 @@ def main():
             snapshot = read_mpris()
         except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError):
             snapshot = {'id': None, 'title': '', 'playback': 'Stopped', 'position': 0}
-        snapshot['playback'] = detector.resolve(snapshot, time.monotonic())
+        now = time.monotonic()
+        snapshot['playback'] = detector.resolve(snapshot, now)
+        snapshot['position'] = clock.resolve(snapshot, now)
         return apply_vlc_clock(snapshot, args.engine, args.unsafe_vlc_clock)
 
     app = LyricsBackend(args.state, lambda track: fetch_lyrics(track, args.storefront, args.engine),
-                        refresh_clock=lambda _: current_snapshot())
+                        refresh_clock=lambda _: current_snapshot(), asynchronous=not args.once)
     while True:
         app.update(current_snapshot())
         if args.once:

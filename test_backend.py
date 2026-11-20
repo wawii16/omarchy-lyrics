@@ -70,6 +70,203 @@ class BackendBehavior(unittest.TestCase):
             self.assertIsInstance(state['updated'], float)
 
 
+    def test_async_incomplete_read_completes_without_leaking_exception(self):
+        import contextlib
+        import http.client
+        import io
+        def fetch(_):
+            raise http.client.IncompleteRead(b'secret-token', 10)
+        with tempfile.TemporaryDirectory() as directory:
+            app = backend.LyricsBackend(Path(directory) / 'state.json', fetch, asynchronous=True)
+            app.track_id, app.generation, app.fetching = '123', 1, True
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                app.fetch_async('123', 1)
+            state = app.update({'id': '123', 'playback': 'Playing', 'position': 0})
+            self.assertTrue(state['unavailable'])
+            self.assertFalse(app.fetching)
+            self.assertEqual(stderr.getvalue(), '')
+
+    def test_async_fetch_does_not_swallow_process_termination(self):
+        def fetch(_):
+            raise SystemExit(7)
+        with tempfile.TemporaryDirectory() as directory:
+            app = backend.LyricsBackend(Path(directory) / 'state.json', fetch, asynchronous=True)
+            with self.assertRaises(SystemExit):
+                app.fetch_async('123', 1)
+
+    def test_async_retry_preserves_unavailable_until_success_or_track_change(self):
+        from unittest.mock import patch
+        docs = {'123': '<tt/>', '456': '<tt/>'}
+        with tempfile.TemporaryDirectory() as directory, patch('backend.threading.Thread'):
+            app = backend.LyricsBackend(Path(directory) / 'state.json', lambda track: docs[track], asynchronous=True)
+            old = {'id': '123', 'playback': 'Playing', 'position': 0}
+            new = {'id': '456', 'playback': 'Playing', 'position': 0}
+            self.assertFalse(app.update(old)['unavailable'])  # Initial fetch.
+            app.fetch_async('123', app.generation)
+            self.assertTrue(app.update(old)['unavailable'])
+            for _ in range(2):
+                app.retry_at = 0
+                self.assertTrue(app.update(old)['unavailable'])  # Retry pending.
+                app.fetch_async('123', app.generation)
+                self.assertTrue(app.update(old)['unavailable'])
+            self.assertFalse(app.update(new)['unavailable'])  # New track loading.
+            app.fetch_async('456', app.generation)
+            self.assertTrue(app.update(new)['unavailable'])
+            app.retry_at = 0
+            self.assertTrue(app.update(new)['unavailable'])
+            docs['456'] = '<tt><p begin="0">Success</p></tt>'
+            app.fetch_async('456', app.generation)
+            state = app.update(new)
+            self.assertEqual((state['unavailable'], state['text']), (False, 'Success'))
+
+    def test_async_fetch_does_not_block_and_discards_late_track_result(self):
+        import threading
+        import time
+        started, release, completed = threading.Event(), threading.Event(), threading.Event()
+        def fetch(track):
+            if track == '123':
+                started.set()
+                release.wait(2)
+                completed.set()
+                return '<tt><p begin="0">Old</p></tt>'
+            return '<tt><p begin="0">New</p><p begin="2">Next</p></tt>'
+        with tempfile.TemporaryDirectory() as directory:
+            app = backend.LyricsBackend(Path(directory) / 'state.json', fetch=fetch, asynchronous=True)
+            old = {'id': '123', 'title': 'Old', 'position': 1, 'playback': 'Playing'}
+            new = {'id': '456', 'title': 'New', 'position': 1, 'playback': 'Playing'}
+            try:
+                state = app.update(old)
+                self.assertTrue(started.wait(1))
+                self.assertFalse(state['unavailable'])
+                app.update(new)
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline:
+                    state = app.update(new)
+                    if state['text'] == 'New':
+                        break
+                    time.sleep(.01)
+                self.assertEqual((state['track_id'], state['text'], state['next_text']), ('456', 'New', 'Next'))
+                release.set()
+                self.assertTrue(completed.wait(1))
+                time.sleep(.02)
+                state = app.update(new)
+                self.assertEqual((state['track_id'], state['text'], state['next_text']), ('456', 'New', 'Next'))
+            finally:
+                release.set()
+
+    def test_instrumental_gap_holds_current_and_next(self):
+        with tempfile.TemporaryDirectory() as directory:
+            app = backend.LyricsBackend(Path(directory) / 'state.json',
+                fetch=lambda _: '<tt><p begin="1" end="2">First</p><p begin="3" end="3.5"> </p><p begin="4" end="5">Second</p></tt>')
+            state = app.update({'id': '123', 'position': 3, 'playback': 'Playing'})
+            self.assertEqual((state['text'], state['next_text']), ('First', 'Second'))
+
+    def test_known_song_end_stops_at_actual_duration_not_lyric_offset(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {'XDG_CONFIG_HOME': directory}):
+            timing = Path(directory) / 'adam-lyrics' / 'timing.json'
+            timing.parent.mkdir()
+            timing.write_text('{"advance_ms": 1000}')
+            app = backend.LyricsBackend(Path(directory) / 'state.json',
+                fetch=lambda _: '<tt><p begin="1" end="2">First</p></tt>')
+            snapshot = {'id': '123', 'position': 9.5, 'duration': 10, 'playback': 'Playing'}
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['playback']), ('First', 'Playing'))
+            snapshot['position'] = 10
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['next_text'], state['playback']), ('', '', 'Stopped'))
+            snapshot['duration'] = 0
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['playback']), ('First', 'Playing'))
+
+    def test_current_and_next_follow_playback_seek_gaps_and_track_switch(self):
+        docs = {'123': '<tt><p begin="1" end="2">First</p><p begin="3" end="4">Second</p></tt>',
+                '456': '<tt><p begin="0" end="5">Other</p></tt>'}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            app = backend.LyricsBackend(path, fetch=docs.get)
+            snapshot = {'id': '123', 'title': 'Song', 'playback': 'Playing', 'position': 0}
+            for position, expected in [(0, ('', 'First')), (1, ('First', 'Second')),
+                                       (2, ('First', 'Second')), (3, ('Second', '')),
+                                       (4, ('Second', '')), (1.5, ('First', 'Second'))]:
+                snapshot['position'] = position
+                state = app.update(snapshot)
+                self.assertEqual((state['text'], state['next_text']), expected)
+                self.assertEqual(json.loads(path.read_text())['next_text'], expected[1])
+            snapshot['position'] = 0
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['next_text']), ('', 'First'))
+            snapshot.update(id='456', position=1)
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['next_text']), ('Other', ''))
+            snapshot.update(id='123', position=0)
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['next_text']), ('', 'First'))
+            snapshot['id'] = None
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['next_text']), ('', ''))
+
+    def test_timing_setting_updates_current_and_next_live_without_mutating_snapshot(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {'XDG_CONFIG_HOME': directory}):
+            timing = Path(directory) / 'adam-lyrics' / 'timing.json'
+            timing.parent.mkdir()
+            app = backend.LyricsBackend(Path(directory) / 'state.json', fetch=lambda _: '<tt><p begin="0">First</p><p begin="3">Second</p><p begin="5">Third</p></tt>')
+            snapshot = {'id': '123', 'title': 'Song', 'playback': 'Paused', 'position': 2.5}
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['next_text']), ('First', 'Second'))
+            timing.write_text('{"advance_ms": 600}')
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['next_text'], state['playback']), ('Second', 'Third', 'Paused'))
+            self.assertEqual(snapshot['position'], 2.5)
+            timing.write_text('{"advance_ms": -600}')
+            snapshot['position'] = 3.5
+            state = app.update(snapshot)
+            self.assertEqual((state['text'], state['next_text']), ('First', 'Second'))
+            self.assertEqual(snapshot['position'], 3.5)
+
+    def test_invalid_timing_files_default_to_zero(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {'XDG_CONFIG_HOME': directory}):
+            timing = Path(directory) / 'adam-lyrics' / 'timing.json'
+            timing.parent.mkdir()
+            app = backend.LyricsBackend(Path(directory) / 'state.json', fetch=lambda _: '<tt><p begin="0">First</p><p begin="3">Second</p></tt>')
+            snapshot = {'id': '123', 'playback': 'Playing', 'position': 2.5}
+            for contents in (b'{', b'\xff', b'[]', b'{}', b'{"advance_ms": "600"}',
+                             b'{"advance_ms": true}', b'{"advance_ms": 600.0}', b'{"advance_ms": 550}'):
+                with self.subTest(contents=contents):
+                    timing.write_bytes(contents)
+                    state = app.update(snapshot)
+                    self.assertEqual((state['text'], state['next_text']), ('First', 'Second'))
+
+    def test_timing_offset_is_clamped_to_two_seconds(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory, patch.dict('os.environ', {'XDG_CONFIG_HOME': directory}):
+            timing = Path(directory) / 'adam-lyrics' / 'timing.json'
+            timing.parent.mkdir()
+            app = backend.LyricsBackend(Path(directory) / 'state.json', fetch=lambda _: '<tt><p begin="0">First</p><p begin="3">Second</p><p begin="5">Third</p></tt>')
+            snapshot = {'id': '123', 'playback': 'Playing', 'position': 2.5}
+            timing.write_text('{"advance_ms": 99900}')
+            self.assertEqual(app.update(snapshot)['text'], 'Second')
+            snapshot['position'] = 4.5
+            timing.write_text('{"advance_ms": -99900}')
+            self.assertEqual(app.update(snapshot)['text'], 'First')
+
+    def test_pending_fetch_is_not_reported_as_unavailable(self):
+        import threading
+        release = threading.Event()
+        with tempfile.TemporaryDirectory() as directory:
+            def fetch(_):
+                release.wait(2)
+                return '<tt/>'
+            app = backend.LyricsBackend(Path(directory) / 'state.json', fetch, asynchronous=True)
+            try:
+                state = app.update({'id': '123', 'title': 'Song', 'position': 0, 'playback': 'Playing'})
+                self.assertFalse(state['unavailable'])
+            finally:
+                release.set()
+
     def test_equal_begin_times_accept_missing_end(self):
         document = '<tt><p begin="1">First</p><p begin="1" end="2">Second</p></tt>'
         self.assertEqual(backend.parse_ttml(document), [(1, None, 'First'), (1, 2, 'Second')])
@@ -79,9 +276,10 @@ class BackendBehavior(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             app = backend.LyricsBackend(Path(directory) / 'state.json', fetch=lambda _: document)
             snapshot = {'id': '123', 'title': 'Song', 'playback': 'Playing', 'position': 2}
+            self.assertEqual(backend.parse_ttml(document), [(1.5, 3, 'A')])
             self.assertEqual(app.update(snapshot)['text'], 'A')
             snapshot['position'] = 3
-            self.assertEqual(app.update(snapshot)['text'], '')
+            self.assertEqual(app.update(snapshot)['text'], 'A')
 
     def test_failed_fetch_produces_unavailable_state_then_retries(self):
         calls = []
@@ -124,6 +322,76 @@ class BackendBehavior(unittest.TestCase):
         self.assertEqual(sample(10.5, .5), 'Playing')
         self.assertEqual(sample(10.5, 2), 'Paused')
         self.assertEqual(sample(100, 2.25), 'Paused')
+
+    def test_coarse_mpris_samples_interpolate_lyric_boundaries(self):
+        clock = backend.MprisClock()
+        with tempfile.TemporaryDirectory() as directory:
+            app = backend.LyricsBackend(Path(directory) / 'state.json',
+                fetch=lambda _: '<tt><p begin="0">First</p><p begin="11.25">Second</p></tt>')
+            def sample(position, now):
+                snapshot = {'id': '123', 'title': 'Song', 'playback': 'Playing', 'position': position}
+                snapshot['position'] = clock.resolve(snapshot, now)
+                return app.update(snapshot)['text']
+            self.assertEqual(sample(10, 0), 'First')
+            self.assertEqual(sample(11, 1), 'First')
+            self.assertEqual(sample(11, 1.25), 'Second')
+
+    def test_clock_stalled_initial_pause_resume_and_bound(self):
+        clock = backend.MprisClock()
+        def sample(pos, now, status='Playing', track='123'):
+            return clock.resolve({'id': track, 'position': pos, 'playback': status}, now)
+        self.assertEqual(sample(10, 0), 10)
+        self.assertEqual(sample(10, 5), 10)  # No motion evidence.
+        self.assertEqual(sample(11, 6), 11)
+        self.assertEqual(sample(11, 6.5), 11.5)
+        self.assertEqual(sample(11, 10), 12)  # Frozen playing status is bounded.
+        self.assertEqual(sample(11, 11, 'Paused'), 11)
+        self.assertEqual(sample(11, 12, 'Paused'), 11)
+        self.assertEqual(sample(11, 13), 11)  # Resume requires fresh motion.
+        self.assertEqual(sample(11, 14), 11)
+        self.assertEqual(sample(12, 15), 12)
+        self.assertEqual(sample(12, 15.25), 12.25)
+
+    def test_clock_seeks_track_switch_and_regressions(self):
+        clock = backend.MprisClock()
+        def sample(pos, now, track='123'):
+            return clock.resolve({'id': track, 'position': pos, 'playback': 'Playing'}, now)
+        self.assertEqual(sample(10, 0), 10)
+        self.assertEqual(sample(11, 1), 11)
+        self.assertEqual(sample(11, 1.75), 11.75)
+        self.assertEqual(sample(11.5, 2), 11.75)  # Coarse update must not regress.
+        self.assertEqual(sample(4, 2.25), 4)  # Backward seek.
+        self.assertEqual(sample(4, 2.5), 4)
+        self.assertEqual(sample(40, 2.75), 40)  # Forward seek.
+        self.assertEqual(sample(40, 3), 40)
+        self.assertEqual(sample(2, 3.25, '456'), 2)
+        self.assertEqual(sample(2, 4, '456'), 2)
+        self.assertEqual(sample(0, 5, None), 0)
+
+    def test_cli_uses_interpolated_mpris_position(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'state.json'
+            samples = iter([
+                {'id': '123', 'title': 'Song', 'position': 10, 'playback': 'Playing'},
+                {'id': '123', 'title': 'Song', 'position': 11, 'playback': 'Playing'},
+                {'id': '123', 'title': 'Song', 'position': 11, 'playback': 'Playing'}])
+            times = iter([0, 1, 1.25])
+            published = []
+            class App:
+                def __init__(self, *args, **kwargs):
+                    pass
+                def update(self, snapshot):
+                    published.append(snapshot['position'])
+                    if len(published) == 3:
+                        raise StopIteration
+            with patch('sys.argv', ['backend', '--state', str(path)]), \
+                    patch('backend.read_mpris', side_effect=lambda: next(samples)), \
+                    patch('backend.time.monotonic', side_effect=lambda: next(times)), \
+                    patch('backend.time.sleep'), patch('backend.LyricsBackend', App):
+                with self.assertRaises(StopIteration):
+                    backend.main()
+            self.assertEqual(published, [10, 11, 11.25])
 
     def test_mpris_snapshot_reads_id_position_and_status(self):
         from unittest.mock import patch
